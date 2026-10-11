@@ -41,7 +41,7 @@ Rejected requests return `401` (REST) or WebSocket close code `1008` (handshake)
 | `TTS_MAX_SYNTHESIS_CONCURRENCY` | `2` | Maximum concurrent Kokoro inferences (shared by REST and WebSocket). Excess requests queue (block) rather than fail. WebSocket Kokoro produces no `ffmpeg` process, so this is its only concurrency guard. |
 | `TTS_MAX_SYNTHESIS_WAITERS` | `16` | Maximum queued normal Kokoro requests, excluding active inference. Excess normal requests fail explicitly; speculative UI prefetch fails fast when no inference slot is immediately available and does not consume this queue. |
 | `TTS_MAX_REQUEST_BODY_BYTES` | `1048576` | Maximum HTTP request-body bytes, enforced for both `Content-Length` and chunked bodies before JSON validation completes. |
-| `TTS_RESPONSE_WRITE_TIMEOUT_SECONDS` | `30` | Timeout for each HTTP response-body write to a slow client. `0` disables this guard. Request-owner cancellation also cancels and awaits any pending child write before synthesis cleanup unwinds. |
+| `TTS_RESPONSE_WRITE_TIMEOUT_SECONDS` | `30` | Timeout for each HTTP response-body write to a slow client, and for each WebSocket control/data frame send. `0` disables this guard. Request-owner cancellation also cancels and awaits any pending child write before synthesis cleanup unwinds. With `0`, a half-open WebSocket client (alive but never reading) can stall the sender and the full output queue indefinitely, pinning the handler and its held synthesis slot — keep this non-zero on untrusted networks. |
 | `KOKORO_MAX_UNIT_CHARS` | `2000` | Maximum characters in one internal Kokoro inference fragment. Longer accepted units are split in order without adding WebSocket `seg` events; hard splits may affect prosody. |
 
 Kokoro currently runs with CPU-only PyTorch wheels in this project. The Docker image and dependency lock do not enable GPU acceleration.
@@ -390,6 +390,7 @@ Separate sentences with `\n` — the server uses these as synthesis units and al
 | `{"type":"start"}` | JSON | Begin processing a request |
 | `{"type":"seg","text":"..."}` | JSON | Sentence boundary marker; marks the start of one synthesis unit in PCM order |
 | Binary frame | `ArrayBuffer` | 24kHz 16-bit mono PCM chunk (typically 2048 bytes) |
+| `{"type":"ping"}` | JSON | Synthesis heartbeat emitted every `15s` while a request is still synthesizing; it carries no timeline meaning and only proves the connection and synthesis are alive (long Edge/Kokoro generations can pause data frames well beyond a client's inactivity threshold) |
 | `{"type":"end"}` | JSON | All audio sent; connection stays open for the next request |
 | `{"type":"error","message":"..."}` | JSON | Request rejected or synthesis failed; connection stays open for the next request |
 

@@ -30,6 +30,10 @@
 - Keep a cancelled in-flight Kokoro worker inside the synthesis limit until the real thread exits, and wake queued Kokoro requests directly on WebSocket cancellation without dispatching the pipeline or leaking a permit.
 - Continue controlled process reaping and release the ffmpeg limiter exactly once when `kill()` raises a non-race `OSError`, instead of skipping `wait()` and the release path; preserve the original stream-timeout or owner-cancellation exception when an earlier termination attempt fails.
 - Correct the Caddy Basic Auth coexistence examples so programmatic `/v1/*` Bearer requests bypass Basic Auth and remain protected by `TTS_API_KEY`.
+- Emit a `{"type":"ping"}` WebSocket heartbeat every 15s while a request is still synthesizing, so long Edge/Kokoro generation gaps no longer trip clients that treat frame silence as a dead stream; `ping` carries no timeline meaning and clients should treat any frame as activity.
+- Preserve newline counts in Markdown cleanup for inline code, images, links, headings, block quotes, list items (including empty list markers like a lone `*`), and horizontal rules, keeping the per-line unit parity between the browser splitter and WebSocket `seg` events; lone marker/decoration lines (`*`, `-`, `***`, `* * *`) are cleared instead of being read as literal symbols.
+- Route letterless synthesis units (separators, pure punctuation) to the neighboring language run via cross-sentence backfill (previous run first, then the following one) in `auto` and Kokoro single-voice modes, instead of spawning phantom runs whose cleaned text is empty and fails the whole stream; a fully letterless document falls back to zh in `auto` mode and to the picked voice in Kokoro single-voice mode.
+- Catch `RecursionError` from deeply nested WebSocket JSON payloads and answer with the normal invalid-JSON error frame instead of letting the exception escape the handler.
 
 ### Known limits (honest)
 

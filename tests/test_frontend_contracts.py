@@ -131,6 +131,7 @@ PREFETCH_CONTROLLED_SETUP = r"""
 globalThis.fetch = async () => ({ ok: true, json: async () => ({
   kokoro: [
     { id: 'af_heart', name: 'Heart', gender: 'female', language: 'en' },
+    { id: 'zf_xiaoxiao', name: 'Xiaoxiao', gender: 'female', language: 'zh' },
   ],
   edge: [
     { id: 'zh-CN-XiaoxiaoNeural', name: 'A', gender: 'Female', locale: 'zh-CN' },
@@ -2509,6 +2510,9 @@ globalThis.AudioContext = class {
 
   mainSock.pushJson({ type: 'unknown' });
   equal(mainInactivityTimer, startId, 'unknown metadata cannot keep a silent connection alive');
+  mainSock.pushJson({ type: 'ping' });
+  const pingId = must(mainInactivityTimer, 'synthesis heartbeat must rearm inactivity');
+  assertOk(pingId !== startId, 'ping replaces the previous inactivity timer');
   mainSock.pushJson({ type: 'seg' });
   const segId = must(mainInactivityTimer, 'seg must rearm inactivity');
   assertOk(segId !== startId, 'seg replaces the start timer');
@@ -2553,6 +2557,9 @@ globalThis.AudioContext = class {
   assertOk(!state1.error, 'stale future timer cannot fail an active slot');
   state1.ws.pushJson({ type: 'unknown' });
   equal(prefetchInactivityTimers.get(state1), startTimerId, 'unknown future metadata cannot rearm inactivity');
+  state1.ws.pushJson({ type: 'ping' });
+  const futurePingId = must(prefetchInactivityTimers.get(state1), 'heartbeat must rearm future inactivity');
+  assertOk(futurePingId !== startTimerId, 'future ping replaces its inactivity timer');
   state1.ws.pushJson({ type: 'seg' });
   state1.ws.pushPcmSamples(3);
   const timerId = must(prefetchInactivityTimers.get(state1), 'future prefetch must own an inactivity timer');
@@ -2618,6 +2625,163 @@ globalThis.AudioContext = class {
 
 
 class UnicodeBoundaryContractTests(unittest.TestCase):
+    def test_auto_letterless_separator_units_inherit_context_both_languages(self):
+        # 回归锁(外部审计主发现的完整方向矩阵)：
+        # - 38b9e67 之前：无字母句(---)被判 en → 中文文本开出幻影 en run，
+        #   其文本清洗后为空、后端必回 error，前端 failCurrentStream 整场停止；
+        # - 38b9e67：句级兜底改成 zh 且"继承前段"是死代码(单句调用 segs 必空)——
+        #   修复翻转成英文文本必停，回归测试只锁了中文方向，未覆盖回归方向；
+        # - 现在：无字母句 isZh=null(诚实未知)，computeSentences 跨句级联回填
+        #   (前向继承→后向回看→全无字母兜底 zh)，中英双向都并入相邻 run。
+        assertions = r"""
+(async () => {
+  await voicesPromise;
+  document.getElementById('engine').value = 'auto';
+  document.getElementById('voiceZh').value = 'zh-CN-XiaoxiaoNeural';
+  document.getElementById('voiceEnAuto').value = 'en-US-AvaNeural';
+
+  // 中文上下文：分隔线并入 zh run(原 bug 方向)
+  document.getElementById('t').value = '甲。\n---\n乙。\n---\n丙。';
+  allSentences = computeSentences();
+  let runs = buildRunsFrom(0);
+  equal(runs.length, 1, 'zh context: separators must not spawn phantom en runs');
+  equal(runs[0].count, 5, 'zh context: all five units stay inside one run');
+  equal(runs[0].text.split('\n').length, 5, 'zh context: count parity preserved');
+
+  // 英文上下文(38b9e67 回归方向)：分隔线并入 en run
+  document.getElementById('t').value = 'Hello.\n---\nWorld.';
+  allSentences = computeSentences();
+  runs = buildRunsFrom(0);
+  equal(runs.length, 1, 'en context: separators must not spawn phantom zh runs');
+  equal(runs[0].voice, 'en-US-AvaNeural', 'en context: units inherit the en voice');
+  equal(runs[0].count, 3, 'en context: all three units stay inside one run');
+
+  // 文档开头无前文：回看后文
+  document.getElementById('t').value = '---\nHello.';
+  allSentences = computeSentences();
+  runs = buildRunsFrom(0);
+  equal(runs.length, 1, 'leading separator looks ahead to the next language');
+  equal(runs[0].voice, 'en-US-AvaNeural', 'leading separator inherits the following en voice');
+
+  // 纯分隔线(全文档无字母)：兜底 zh(与既有行为一致，后端回错误属合理语义)
+  document.getElementById('t').value = '---';
+  const onlySep = computeSentences();
+  equal(onlySep.length, 1, 'separator-only text yields one unit');
+  assertOk(onlySep[0].voice !== 'en-US-AvaNeural', 'no-context fallback stays zh');
+
+  // 正常混排不受级联影响
+  document.getElementById('t').value = '中文A。hello。';
+  const mixed = computeSentences();
+  equal(mixed.length, 3, 'normal mixed-language split unchanged');
+  equal(mixed[1].voice, 'en-US-AvaNeural', 'latin seg still routes to the en voice');
+
+  // kokoro 单音色：en 音色下 --- 跟随所选音色(38b9e67 会推给默认 zh 音色)
+  document.getElementById('engine').value = 'kokoro';
+  document.getElementById('voice').value = 'af_heart';
+  document.getElementById('t').value = 'Well.\n---\nDone.';
+  const kokoroUnits = computeSentences();
+  equal(kokoroUnits.length, 3, 'kokoro en: three units');
+  assertOk(kokoroUnits.every(u => u.voice === 'af_heart'), 'kokoro en: letterless unit follows the picked voice');
+  finish();
+})().catch(err => { throw err; });
+"""
+        run_node_contract("index.html", PREFETCH_CONTROLLED_SETUP, assertions)
+
+    def test_kokoro_letterless_quadrant_matrix_and_pure_punctuation(self):
+        # 四象限回归矩阵(审计建议)：音色选取(en/zh) x 邻段语言(zh-zh/en-en/
+        # zh-en/en-zh) x 标记行位置(前/中/尾) = 24 组合。
+        # 判别力前提(审计实证)：voiceDatabase 必须同时装载 zh/en 两个 kokoro
+        # 音色——单音色 stub 会让 defaultKokoroVoice 对另一语言兜底回所选
+        # 音色，矩阵塌缩成恒 1 run，对修复前版本(1a71bd3)也 24/24 空转通过。
+        # 期望：mono 语言 1 个 run；混语言 2 个 run(两音色各一)；标记行必须
+        # 附着邻段 run(前邻优先，文档开头并后邻)，不得孤立成 run；语言内容
+        # 必须骑在对应语言音色上，与所选音色无关。
+        # 另锁纯标点第二致命路径(kokoro+auto 双方向)："！"无字母 -> 级联
+        # 并入前邻 run——若孤立成 run，clean 后非空但无可读内容 -> no-PCM
+        # error -> 整场停止。
+        assertions = r"""
+(async () => {
+  await voicesPromise;
+  const zhKokoro = 'zf_xiaoxiao', enKokoro = 'af_heart';
+  assertOk(voiceDatabase.kokoro.some(v => v.value === zhKokoro && v.region === 'CN')
+        && voiceDatabase.kokoro.some(v => v.value === enKokoro && v.region === 'US'),
+    'stub must ship both zh/en kokoro voices or the matrix loses discriminating power');
+  const matrixCases = [];
+  for (const picked of [enKokoro, zhKokoro]) {
+    for (const [label, before, after] of [
+      ['zh-zh', '甲。', '乙。'],
+      ['en-en', 'Hello.', 'World.'],
+      ['zh-en', '甲。', 'World.'],
+      ['en-zh', 'Hello.', '乙。'],
+    ]) {
+      for (const [pos, parts] of [
+        ['front', ['---', before, after]],
+        ['mid', [before, '---', after]],
+        ['tail', [before, after, '---']],
+      ]) {
+        matrixCases.push({ picked, label, pos, before, after, text: parts.join(String.fromCharCode(10)) });
+      }
+    }
+  }
+  for (const c of matrixCases) {
+    document.getElementById('engine').value = 'kokoro';
+    document.getElementById('voice').value = c.picked;
+    document.getElementById('t').value = c.text;
+    allSentences = computeSentences();
+    const runs = buildRunsFrom(0);
+    const tag = `kokoro ${c.picked}/${c.label}/${c.pos}`;
+    const expectRuns = (c.label === 'zh-zh' || c.label === 'en-en') ? 1 : 2;
+    equal(runs.length, expectRuns, `${tag}: expected ${expectRuns} voice-run(s)`);
+    equal(runs.reduce((a, r) => a + r.text.split('\n').length, 0), 3, `${tag}: line parity preserved`);
+    assertOk(runs.every(r => r.text !== '---'), `${tag}: marker line must not form its own run`);
+    assertOk(runs.every(r => r.voice !== ''), `${tag}: voice must resolve`);
+    // 标记行附着语义：前邻优先；front 并后邻(before 句)，tail 并前邻(after 句)
+    const markerRun = runs.find(r => r.text.split('\n').includes('---'));
+    const neighbor = (c.pos === 'tail') ? c.after : c.before;
+    assertOk(markerRun.text.split('\n').includes(neighbor),
+      `${tag}: marker attaches to the ${c.pos === 'front' ? 'following' : 'previous'} neighbor run`);
+    // 语言->音色路由：zh 内容骑 zh 音色、en 内容骑 en 音色(不随所选音色漂移)
+    for (const r of runs) {
+      const lines = r.text.split('\n');
+      const hasZh = lines.some(l => l.includes('甲') || l.includes('乙'));
+      const hasEn = lines.some(l => l.includes('Hello') || l.includes('World'));
+      if (hasZh) equal(r.voice, zhKokoro, `${tag}: zh content rides the zh voice`);
+      if (hasEn) equal(r.voice, enKokoro, `${tag}: en content rides the en voice`);
+    }
+  }
+  // kokoro 纯标点("！"无字母)第二致命路径：并入前邻 run，不得孤立成 run
+  document.getElementById('engine').value = 'kokoro';
+  document.getElementById('voice').value = enKokoro;
+  document.getElementById('t').value = '好。\n！\n好。';
+  allSentences = computeSentences();
+  let punctRuns = buildRunsFrom(0);
+  equal(punctRuns.length, 1, 'kokoro: pure-punctuation unit joins the zh neighbor run');
+  equal(punctRuns[0].voice, zhKokoro, 'kokoro: punctuation rides the neighboring zh voice');
+  equal(punctRuns[0].count, 3, 'kokoro: count parity preserved for punctuation unit');
+  document.getElementById('voice').value = zhKokoro;
+  document.getElementById('t').value = 'Well.\n!\nDone.';
+  allSentences = computeSentences();
+  punctRuns = buildRunsFrom(0);
+  equal(punctRuns.length, 1, 'kokoro: pure-punctuation unit joins the en neighbor run');
+  equal(punctRuns[0].voice, enKokoro, 'kokoro: punctuation rides the neighboring en voice');
+  // auto 对照：纯标点并入邻 run + 前邻优先
+  document.getElementById('engine').value = 'auto';
+  document.getElementById('voiceZh').value = 'zh-CN-XiaoxiaoNeural';
+  document.getElementById('voiceEnAuto').value = 'en-US-AvaNeural';
+  document.getElementById('t').value = '甲。\n！\n乙。';
+  allSentences = computeSentences();
+  const autoPunctRuns = buildRunsFrom(0);
+  equal(autoPunctRuns.length, 1, 'pure-punctuation unit must join the neighbor run');
+  equal(autoPunctRuns[0].count, 3, 'count parity preserved for punctuation unit');
+  document.getElementById('t').value = '甲。\n---\nWorld.';
+  allSentences = computeSentences();
+  const autoMix = buildRunsFrom(0);
+  equal(autoMix[0].voice, 'zh-CN-XiaoxiaoNeural', 'auto trailing-marker joins the previous zh neighbor (前邻优先)');
+  finish();
+})().catch(err => { throw err; });
+"""
+        run_node_contract("index.html", PREFETCH_CONTROLLED_SETUP, assertions)
+
     def test_text_limit_counts_astral_code_points_without_splitting_surrogate(self):
         setup = r"""
 globalThis.fetch = async (url) => {
@@ -2720,6 +2884,14 @@ document.getElementById('engine').value = 'auto';
 (async () => {
   await voicesPromise;
   updateVoices();
+  // 版本守卫：本测试锁定"硬编码 HAN 表不含未分配尾段码点"。若运行时 UCD
+  // 已把该码点升级为字母(node 新版 V8/UCD)，它会经 \p{L} 路径自然路由到
+  // 非中文音色，测试前提不成立——跳过而非失败(WSL node20/Win node24 实测分叉)。
+  const probeCh = String.fromCodePoint(0x2CEA2);
+  if (!/\p{L}/u.test(probeCh)) {
+    finish();
+    return;
+  }
   document.getElementById('voiceZh').value = 'zf_xiaoxiao';
   document.getElementById('voiceEnAuto').value = 'af_heart';
   document.getElementById('t').value = '\u{2CEA2}';

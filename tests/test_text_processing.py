@@ -48,6 +48,39 @@ class CleanTextTests(unittest.TestCase):
                     app.clean_text(src).count("\n"), src.count("\n")
                 )
 
+    def test_cross_line_and_blank_line_patterns_preserve_line_count(self):
+        # 属性测试(随机差分)发现的三处换行吞噬回归的最小复现：
+        # 1) 行内代码/链接/图片的字符类含 \n 时跨行配对吞换行；
+        # 2) 行首 \s{0,3} 可跨空行把引用/标题吸到上一行；
+        # 3) 列表规则的 \s+ 尾巴吞掉空列表项("*"+换行)的换行。
+        for src in (
+            "A\n`x\ny`z\nB",            # 行内代码跨行
+            "A\n[t\ne](u\nv)w\nB",      # 链接文字与地址跨行
+            "A\n![i\nm](a\nb)\nB",      # 图片跨行
+            "A\n\n> quote\nB",          # 引用规则行首 \s{0,3} 吞空行
+            "A\n\n# H\nB",              # 标题规则行首 \s{0,3} 吞空行
+            "A\n*\nB",                  # 空列表项：* + 换行
+            "A\n1.\nB",                 # 空有序列表项
+            "A\n*\n\n> q\nB",           # 组合：列表+空行+引用
+        ):
+            with self.subTest(src=src):
+                self.assertEqual(
+                    app.clean_text(src).count("\n"), src.count("\n")
+                )
+
+    def test_lone_marker_lines_cleared_but_lines_kept(self):
+        # 突变审计次级项回归锁：孤立标记行(*, -, ***)是装饰符——旧 \s+ 规则
+        # 连带吞行(行数 bug)，保行修正后字面符号残留为可读文本(离线无引擎，TTS 是否实际发声未实测)。现在清空内容、
+        # 保留换行；列表项("- item")仍剥标记保留文字。
+        self.assertEqual(app.clean_text("*"), "")
+        self.assertEqual(app.clean_text("-"), "")
+        self.assertEqual(app.clean_text("***"), "")
+        self.assertEqual(app.clean_text("* * *"), "")
+        self.assertEqual(app.clean_text("A\n*\nB"), "A\n\nB")
+        self.assertEqual(app.clean_text("A\n-\nB").count("\n"), 2)
+        self.assertEqual(app.clean_text("- item"), "item")
+        self.assertEqual(app.clean_text("A-B"), "A-B")
+
     def test_inline_code_keeps_inner_text(self):
         self.assertEqual(app.clean_text("use `pip install` now"), "use pip install now")
 

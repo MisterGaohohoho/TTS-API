@@ -498,7 +498,16 @@ function splitByLanguage(text) {
         }
     }
     const cleaned = pythonStrip(cur);
-    if (cleaned) segs.push({ text: cleaned, isZh: curZh ?? false });
+    if (cleaned) {
+        // 无字母整句(如独立 "---" 行)：语言未知，诚实标记 null，交由
+        // computeSentences 按跨句上下文回填。绝不能在此凭空兜底 en/zh——
+        // 本函数按句调用、segs 每次新建，句内继承不可达；判成 en 会让
+        // 中文文本的分隔线开出幻影 en run，判成 zh 会同样毁掉英文文本
+        // (38b9e67 的教训：两种硬编码各毁一种语言)。null 段在消费端
+        // 并入相邻 run，清洗后仅保留停顿语义，seg 计数对偶不变。
+        // (句内尾段如 "hello ---" 的 curZh 必非 null，正常跟随句语言。)
+        segs.push({ text: cleaned, isZh: curZh === null ? null : curZh });
+    }
 
     // 合并相邻同语言段(切分过程中非字母字符可能造成同语言相邻)
     const merged = [];
@@ -511,6 +520,31 @@ function splitByLanguage(text) {
         }
     }
     return merged;
+}
+
+// 无字母段(isZh=null，语言未知)的跨句级联回填——前邻优先：
+// forward 用前邻语言填充(seed=null，文档开头无前邻则保持 null)；
+// backward 只兜仍为 null 的段(并入后邻 run)。整篇仍为 null(全文档
+// 无字母)时不在此兜底，由消费端退化：kokoro 按所选音色、auto 按 zh，
+// 沿用后端"清洗后为空"的既有 error 语义。任何固定规则兜底(??en/??zh)
+// 都会给另一种语言留下"清洗后为空"的幻影 run 半空间(38b9e67 与其前身
+// 的双重教训)，只有邻段级联能全谱消除。
+function backfillLetterless(perSentence) {
+    let prevLang = null;
+    for (const segs of perSentence) {
+        for (const seg of segs) {
+            if (seg.isZh === null) seg.isZh = prevLang;
+            else prevLang = seg.isZh;
+        }
+    }
+    let nextLang = null;
+    for (let i = perSentence.length - 1; i >= 0; i--) {
+        const segs = perSentence[i];
+        for (let j = segs.length - 1; j >= 0; j--) {
+            if (segs[j].isZh === null) segs[j].isZh = nextLang;
+            else nextLang = segs[j].isZh;
+        }
+    }
 }
 
 // 某语言的默认 Kokoro 音色：voiceDatabase.kokoro 中该语言(按 region)的首个音色。
@@ -561,24 +595,35 @@ function computeSentences() {
         // Kokoro 单音色：按语言分段。选中音色负责其本语言，另一语言用同引擎默认音色。
         const picked = document.getElementById("voice").value;
         const pickedIsZh = (voiceDatabase.kokoro.find(v => v.value === picked) || {}).region === "CN";
+        const perSentence = sentences.map((s) => splitByLanguage(s));
+        // 无字母段(isZh=null)经邻段级联并入相邻 run；全文档无字母才退化
+        // 到所选音色(沿用后端"清洗后为空"的既有 error 语义)。
+        backfillLetterless(perSentence);
         const out = [];
-        for (const s of sentences) {
-            for (const seg of splitByLanguage(s)) {
-                // 段语言 == 选中音色语言 → 用选中音色；否则用另一语言的默认 Kokoro 音色兜底
-                const voice = (seg.isZh === pickedIsZh) ? picked : (defaultKokoroVoice(seg.isZh) || picked);
+        for (const segs of perSentence) {
+            for (const seg of segs) {
+                const isZh = seg.isZh === null ? pickedIsZh : seg.isZh;
+                const voice = (isZh === pickedIsZh) ? picked : (defaultKokoroVoice(isZh) || picked);
                 out.push({ engine: "kokoro", voice, text: seg.text });
             }
         }
         return out;
     }
 
-    // Auto：逐句判定语言，中文段用中文音色、英文段用英文音色(可跨引擎)
+    // Auto：逐句判定语言，中文段用中文音色、英文段用英文音色(可跨引擎)。
+    // 无字母段(isZh=null，如独立 "---" 行)按跨句上下文回填：前邻优先、
+    // 后邻兜底、全文档无字母才兜底 zh。若在句级凭空兜底 en/zh，中/英文
+    // 文本各自的分隔线都会开出清洗后为空的幻影 run(后端必回 error，前端
+    // 整场停止)——38b9e67 与其前身的双重教训。
     const zhVoice = document.getElementById("voiceZh").value;
     const enVoice = document.getElementById("voiceEnAuto").value;
+    const perSentence = sentences.map((s) => splitByLanguage(s));
+    backfillLetterless(perSentence);
     const out = [];
-    for (const s of sentences) {
-        for (const seg of splitByLanguage(s)) {
-            const voice = seg.isZh ? zhVoice : enVoice;
+    for (const segs of perSentence) {
+        for (const seg of segs) {
+            const isZh = seg.isZh ?? true;
+            const voice = isZh ? zhVoice : enVoice;
             out.push({ engine: engineOfVoice(voice), voice, text: seg.text });
         }
     }
@@ -1387,6 +1432,8 @@ function beginPrefetch(targetRunIndex) {
         try {
             const meta = JSON.parse(e.data);
             if (meta.type === "start") touchInactivity();
+            // 合成心跳：与主路径同理，证明生成仍存活(不计入 segOffsets)。
+            if (meta.type === "ping") touchInactivity();
             // 与主路径一致：seg 标记「下一单元音频」起点 = 当前已收样本数
             if (meta.type === "seg") {
                 touchInactivity();
@@ -1580,6 +1627,12 @@ function sendRequest() {
         let meta;
         try { meta = JSON.parse(e.data); } catch (_) { return; }
         if (meta.type === "start") {
+            armMainInactivityDeadline();
+            return;
+        }
+        // 合成心跳：Edge 长文本/长单元推理存在远超预期的无帧间隙，
+        // ping 仅用于证明连接与生成仍存活，不计入句级时间线。
+        if (meta.type === "ping") {
             armMainInactivityDeadline();
             return;
         }
